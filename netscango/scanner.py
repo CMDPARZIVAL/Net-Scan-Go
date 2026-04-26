@@ -115,8 +115,12 @@ class NetworkScanner:
         if self.should_stop_scan(current_scan_id):
             return False
         try:
+            # Find correct interface for target IP
+            correct_interface, _, _ = conf.route.route(ip)
+            conf.iface = correct_interface
+            
             pkt = IP(dst=ip) / ICMP()
-            resp = sr1(pkt, timeout=self.config.PING_TIMEOUT, verbose=0)
+            resp = sr1(pkt, timeout=self.config.PING_TIMEOUT, verbose=0, iface=correct_interface)
             return resp is not None
         except OSError:
             return self.tcp_probe_any(ip, current_scan_id)
@@ -127,14 +131,18 @@ class NetworkScanner:
         if self.should_stop_scan(current_scan_id):
             return False, None
         try:
+            # Find correct interface for target IP
+            correct_interface, _, _ = conf.route.route(ip)
+            conf.iface = correct_interface
+            
             pkt = IP(dst=ip) / TCP(dport=port, flags="S")
-            resp = sr1(pkt, timeout=self.config.SYN_TIMEOUT, verbose=0)
+            resp = sr1(pkt, timeout=self.config.SYN_TIMEOUT, verbose=0, iface=correct_interface)
             if resp is None:
                 return False, None
             if resp.haslayer(TCP) and resp[TCP].flags == 0x12:
                 try:
                     rst = IP(dst=ip) / TCP(dport=port, flags="R")
-                    sr1(rst, timeout=0.1, verbose=0)
+                    sr1(rst, timeout=0.1, verbose=0, iface=correct_interface)
                 except:
                     pass
                 return True, resp
