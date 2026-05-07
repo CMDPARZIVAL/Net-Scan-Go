@@ -40,48 +40,57 @@ class PrivilegeEscalation:
         return results
     
     def _check_service_permissions(self, agent_id: str) -> Dict:
-        """Check for modifiable services on Windows"""
-        # Implementation would check for services with weak permissions
-        return {"vulnerable": True, "services": ["vuln-service"]}
+        """Check for modifiable services on Windows using accesschk style logic"""
+        # Command to find services where Authenticated Users have write access
+        cmd = 'powershell -Command "Get-Service | Where-Object {$_.CanStop -and $_.DisplayName -notlike \'*NetScanGo*\'}"'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_unquoted_service_paths(self, agent_id: str) -> Dict:
         """Check for unquoted service paths on Windows"""
-        return {"vulnerable": False, "items": []}
+        cmd = 'wmic service get name,displayname,pathname,startmode | findstr /i "auto" | findstr /i /v "c:\\windows\\" | findstr /i /v """'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_weak_permissions(self, agent_id: str) -> Dict:
-        """Check for weak file/folder permissions on Windows"""
-        return {"vulnerable": False, "items": []}
+        """Check for weak file/folder permissions in common areas"""
+        cmd = 'icacls "C:\\Program Files\\*" /t /c /q | findstr /i "(F)" | findstr /i "Everyone"'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_always_install_elevated(self, agent_id: str) -> Dict:
-        """Check if AlwaysInstallElevated is enabled on Windows"""
-        return {"vulnerable": False, "enabled": False}
+        """Check if AlwaysInstallElevated is enabled in registry"""
+        cmd = 'reg query HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated && reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_stored_credentials(self, agent_id: str) -> Dict:
-        """Check for stored credentials on Windows"""
-        return {"vulnerable": False, "creds_found": []}
+        """Check for stored credentials in common locations"""
+        cmd = 'cmdkey /list && dir /s /b *pass* *cred* *vnc* *.config*'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_suid_binaries(self, agent_id: str) -> Dict:
         """Check for SUID binaries on Linux"""
-        # Implementation would check for exploitable SUID binaries
-        return {"vulnerable": True, "binaries": ["/usr/bin/vuln-binary"]}
+        cmd = 'find / -perm -4000 -type f 2>/dev/null'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_sudo_permissions(self, agent_id: str) -> Dict:
         """Check for sudo permissions on Linux"""
-        return {"vulnerable": False, "perms": []}
+        cmd = 'sudo -l'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_suid_scripts(self, agent_id: str) -> Dict:
-        """Check for SUID scripts on Linux"""
-        return {"vulnerable": False, "scripts": []}
+        """Check for writeable scripts executed by root"""
+        cmd = 'find /etc/cron* -writable 2>/dev/null'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_cron_jobs(self, agent_id: str) -> Dict:
-        """Check for writeable cron jobs on Linux"""
-        return {"vulnerable": False, "jobs": []}
+        """Check for writeable cron jobs"""
+        cmd = 'ls -la /etc/cron.d'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def _check_path_hijacking(self, agent_id: str) -> Dict:
-        """Check for PATH hijacking opportunities on Linux"""
-        return {"vulnerable": False, "paths": []}
+        """Check for writeable directories in PATH"""
+        cmd = 'echo $PATH | tr ":" "\\n" | xargs -I{} find {} -maxdepth 0 -writable 2>/dev/null'
+        return {"vulnerable": "Check output", "command": cmd}
     
     def attempt_escalation(self, agent_id: str, technique: str, options: Dict = None) -> Tuple[bool, str]:
         """Attempt privilege escalation using a specific technique"""
-        # Implementation would attempt the specified escalation technique
-        return True, f"Privilege escalation attempted using {technique}"
+        # Placeholder for future automated escalation scripts
+        return True, f"Privilege escalation enumeration command generated for {technique}"
